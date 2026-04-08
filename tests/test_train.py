@@ -372,7 +372,7 @@ class TestTrainIntegration:
         config["tag"] = "test"
         config["seed"] = 42
 
-        output_dir, best_acc = train(config)
+        output_dir, best_acc, test_metrics = train(config)
 
         # 验证输出文件
         assert output_dir.exists()
@@ -418,7 +418,7 @@ class TestTrainIntegration:
         config["pretrained"] = False
         config["tag"] = "loadtest"
 
-        output_dir, _ = train(config)
+        output_dir, _, _ = train(config)
 
         checkpoint = torch.load(
             output_dir / "best_model.pth",
@@ -457,7 +457,7 @@ class TestBuildDataloadersClassFilter:
         config["batch_size"] = 4
         config["num_workers"] = 0
 
-        train_loader, val_loader, class_to_idx, num_classes = build_dataloaders(config)
+        train_loader, val_loader, test_loader, class_to_idx, num_classes = build_dataloaders(config)
 
         # elephant 不应出现在类别映射中
         assert "elephant" not in class_to_idx
@@ -473,7 +473,7 @@ class TestBuildDataloadersClassFilter:
         config["batch_size"] = 4
         config["num_workers"] = 0
 
-        train_loader, val_loader, class_to_idx, num_classes = build_dataloaders(config)
+        train_loader, val_loader, test_loader, class_to_idx, num_classes = build_dataloaders(config)
 
         assert set(class_to_idx.keys()) == {"cat", "dog", "tiger", "lion"}
         assert num_classes == 4
@@ -548,6 +548,6 @@ class TestTrainErrorHandling:
         config["pretrained"] = False
         config["tag"] = "zero_epochs"
 
-        output_dir, best_acc = train(config)
+        output_dir, best_acc, _ = train(config)
         assert output_dir.exists()
         assert best_acc == 0.0  # 没有训练，最佳准确率为 0

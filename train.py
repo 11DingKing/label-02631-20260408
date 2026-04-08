@@ -121,7 +121,12 @@ def get_data_transforms(is_training: bool):
 
 
 def build_dataloaders(config: dict):
-    """构建数据加载器，仅加载白名单中的类别"""
+    """构建数据加载器，仅加载白名单中的类别
+    
+    加载 train/val/test 三个数据集：
+    - train: 使用训练增强（随机裁剪、翻转、旋转、颜色抖动）
+    - val/test: 使用验证/测试变换（仅调整大小和归一化）
+    """
     dataset_root = Path(config["dataset_root"])
 
     # ── 类别白名单过滤 ──
@@ -136,6 +141,7 @@ def build_dataloaders(config: dict):
 
     train_root = str(dataset_root / "train")
     val_root = str(dataset_root / "val")
+    test_root = str(dataset_root / "test")
 
     def _build_filtered_dataset(root: str, transform, allowed: set = None):
         """构建仅包含白名单类别的 ImageFolder 数据集"""
@@ -158,6 +164,27 @@ def build_dataloaders(config: dict):
     val_dataset = _build_filtered_dataset(
         val_root, get_data_transforms(is_training=False), allowed_classes,
     )
+    
+    # 加载测试集（如果存在）
+    test_dataset = None
+    test_loader = None
+    if Path(test_root).exists():
+        try:
+            test_dataset = _build_filtered_dataset(
+                test_root, get_data_transforms(is_training=False), allowed_classes,
+            )
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=config["batch_size"],
+                shuffle=False,
+                num_workers=config["num_workers"],
+                pin_memory=True,
+            )
+            logger.info(f"测试集样本数: {len(test_dataset)}")
+        except Exception as e:
+            logger.warning(f"测试集加载失败（将跳过测试集评估）: {e}")
+    else:
+        logger.warning(f"测试集目录不存在: {test_root}，将跳过测试集评估")
 
     # 日志：检查是否有白名单外的目录存在
     if allowed_classes is not None:
@@ -191,7 +218,7 @@ def build_dataloaders(config: dict):
         pin_memory=True,
     )
 
-    return train_loader, val_loader, train_dataset.class_to_idx, len(train_dataset.classes)
+    return train_loader, val_loader, test_loader, train_dataset.class_to_idx, len(train_dataset.classes)
 
 
 
@@ -413,7 +440,7 @@ def train(config: dict):
     logger.info("加载数据集...")
     data_load_start = time.time()
     try:
-        train_loader, val_loader, class_to_idx, num_classes = build_dataloaders(config)
+        train_loader, val_loader, test_loader, class_to_idx, num_classes = build_dataloaders(config)
     except FileNotFoundError as e:
         logger.error(f"数据集目录不存在: {e}")
         logger.error("请先运行 prepare_data.py 准备数据集。")
@@ -535,7 +562,50 @@ def train(config: dict):
         "class_to_idx": class_to_idx,
     }, output_dir / "final_model.pth")
 
-    return output_dir, best_val_acc
+    # ── 测试集评估 ──
+    test_metrics = None
+    if test_loader is not None:
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("开始测试集评估")
+        logger.info("=" * 60)
+        
+        # 加载最佳模型进行测试
+        best_model_path = output_dir / "best_model.pth"
+        if best_model_path.exists():
+            logger.info(f"加载最佳模型进行测试: {best_model_path}")
+            checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
+            model.load_state_dict(checkpoint["model_state_dict"])
+        
+        test_metrics = validate(model, test_loader, criterion, device)
+        logger.info(f"测试集结果 - Loss: {test_metrics['loss']:.4f} Acc: {test_metrics['accuracy']:.2f}%")
+        
+        # 保存测试集指标
+        test_results = {
+            "test_loss": test_metrics["loss"],
+            "test_accuracy": test_metrics["accuracy"],
+            "best_val_accuracy": best_val_acc,
+            "best_epoch": best_epoch,
+        }
+        with open(output_dir / "test_results.json", "w") as f:
+            json.dump(test_results, f, indent=2)
+        logger.info(f"测试集结果已保存: {output_dir / 'test_results.json'}")
+        
+        # 对比验证集和测试集准确率
+        acc_diff = best_val_acc - test_metrics["accuracy"]
+        if abs(acc_diff) > 5.0:
+            logger.warning(
+                f"⚠️ 验证集准确率 ({best_val_acc:.2f}%) 与测试集准确率 ({test_metrics['accuracy']:.2f}%) "
+                f"差距较大 ({acc_diff:+.2f}%)，可能存在过拟合或数据泄露问题"
+            )
+        else:
+            logger.info(
+                f"✓ 验证集与测试集准确率差距合理 ({acc_diff:+.2f}%)"
+            )
+    else:
+        logger.warning("测试集不可用，跳过测试集评估")
+
+    return output_dir, best_val_acc, test_metrics
 
 
 def main():
@@ -546,12 +616,14 @@ def main():
     for k, v in sorted(config.items()):
         logger.info(f"  {k}: {v}")
 
-    output_dir, best_acc = train(config)
+    output_dir, best_acc, test_metrics = train(config)
 
     logger.info(f"\n训练结果保存在: {output_dir}")
     logger.info(f"最佳验证准确率: {best_acc:.2f}%")
+    if test_metrics is not None:
+        logger.info(f"测试集准确率: {test_metrics['accuracy']:.2f}%")
 
-    return output_dir, best_acc
+    return output_dir, best_acc, test_metrics
 
 
 if __name__ == "__main__":

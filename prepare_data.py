@@ -298,9 +298,6 @@ def generate_synthetic_dataset(dataset_root: Path = None):
         logger.error("需要安装 Pillow 和 numpy: pip install Pillow numpy")
         return False
 
-    random.seed(RANDOM_SEED)
-    np.random.seed(RANDOM_SEED)
-
     # 每类的视觉特征配置
     class_configs = {
         "cat": {
@@ -340,39 +337,47 @@ def generate_synthetic_dataset(dataset_root: Path = None):
     img_size = 224
 
     def create_animal_image(
-        cls_name: str, config: dict, idx: int, variation: str = "train"
+        cls_name: str, config: dict, idx: int, split: str, rng: random.Random
     ) -> "Image.Image":
-        """生成具有类别特征的合成图片"""
-        base_color = list(random.choice(config["base_colors"]))
+        """生成具有类别特征的合成图片
+        
+        Args:
+            cls_name: 类别名称
+            config: 类别配置
+            idx: 图片索引
+            split: 数据集划分 (train/val)
+            rng: 独立的随机数生成器，确保不同split使用不同的随机状态
+        """
+        base_color = list(rng.choice(config["base_colors"]))
         for i in range(3):
-            base_color[i] = max(0, min(255, base_color[i] + random.randint(-20, 20)))
+            base_color[i] = max(0, min(255, base_color[i] + rng.randint(-20, 20)))
         base_color = tuple(base_color)
 
         img = Image.new("RGB", (img_size, img_size), base_color)
         draw = ImageDraw.Draw(img)
 
         # 添加背景纹理
-        for _ in range(random.randint(50, 150)):
-            x = random.randint(0, img_size - 1)
-            y = random.randint(0, img_size - 1)
+        for _ in range(rng.randint(50, 150)):
+            x = rng.randint(0, img_size - 1)
+            y = rng.randint(0, img_size - 1)
             noise_color = tuple(
-                max(0, min(255, c + random.randint(-30, 30))) for c in base_color
+                max(0, min(255, c + rng.randint(-30, 30))) for c in base_color
             )
             draw.point((x, y), fill=noise_color)
 
         # 绘制纹理和形状
-        _draw_pattern(draw, img_size, config["pattern"], config["accent_color"], random)
-        _draw_shape(draw, img_size, config["shape"], config["accent_color"], random)
+        _draw_pattern(draw, img_size, config["pattern"], config["accent_color"], rng)
+        _draw_shape(draw, img_size, config["shape"], config["accent_color"], rng)
 
         # 添加随机变换增加多样性
-        if random.random() > 0.5:
+        if rng.random() > 0.5:
             img = img.transpose(Image.FLIP_LEFT_RIGHT)
-        if random.random() > 0.7:
-            angle = random.randint(-15, 15)
+        if rng.random() > 0.7:
+            angle = rng.randint(-15, 15)
             img = img.rotate(angle, fillcolor=base_color)
-        if random.random() > 0.6:
+        if rng.random() > 0.6:
             img = img.filter(
-                ImageFilter.GaussianBlur(radius=random.uniform(0.3, 1.0))
+                ImageFilter.GaussianBlur(radius=rng.uniform(0.3, 1.0))
             )
 
         return img
@@ -394,9 +399,14 @@ def generate_synthetic_dataset(dataset_root: Path = None):
                 logger.info(f"  {split}/{cls_name}: 已有 {existing} 张，跳过")
                 continue
 
-            logger.info(f"  生成 {split}/{cls_name}: {needed} 张图片...")
+            # 为每个类别和split使用独立的随机种子，确保train和val的随机状态完全独立
+            # 这样可以防止训练集和验证集的图片特征过于相似
+            split_seed = RANDOM_SEED + hash(cls_name) % 1000 + (100 if split == "val" else 0)
+            rng = random.Random(split_seed)
+            
+            logger.info(f"  生成 {split}/{cls_name}: {needed} 张图片 (seed={split_seed})...")
             for i in range(needed):
-                img = create_animal_image(cls_name, config, i, split)
+                img = create_animal_image(cls_name, config, i, split, rng)
                 img.save(
                     split_dir / f"{cls_name}_{split}_{i:04d}.jpg", "JPEG", quality=90
                 )
