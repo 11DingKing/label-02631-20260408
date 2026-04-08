@@ -1,0 +1,43 @@
+services:
+  # 主服务：一键运行完整流水线（数据准备 → 训练 → 评估 → 调优）
+  animal-classifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: animal-classifier
+    shm_size: '2gb'
+    volumes:
+      # 训练输出持久化到宿主机，容器退出后结果不丢失
+      - ./outputs:/app/outputs
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONIOENCODING=utf-8
+      - LANG=zh_CN.UTF-8
+      - LC_ALL=zh_CN.UTF-8
+      - IN_DOCKER=1
+    restart: "no"
+    # GPU 支持（有 NVIDIA GPU 时取消注释）
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # 测试服务：运行全部单元测试（质检验收用）
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: animal-classifier-test
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONIOENCODING=utf-8
+      - LANG=zh_CN.UTF-8
+      - LC_ALL=zh_CN.UTF-8
+      - IN_DOCKER=1
+    command: ["python", "-m", "pytest", "tests/", "-v", "--tb=short"]
+    restart: "no"
+    profiles:
+      - test
