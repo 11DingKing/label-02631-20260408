@@ -623,6 +623,208 @@ def print_dataset_summary(
     return class_totals
 
 
+def compute_file_hash(file_path: Path, chunk_size: int = 8192) -> str:
+    """计算文件的 MD5 哈希值
+    
+    Args:
+        file_path: 文件路径
+        chunk_size: 分块读取大小（字节）
+    
+    Returns:
+        str: MD5 哈希值的十六进制字符串
+    """
+    import hashlib
+    md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(chunk_size):
+            md5.update(chunk)
+    return md5.hexdigest()
+
+
+def verify_no_data_leakage(
+    dataset_root: Path = None,
+    classes: list = None,
+) -> dict:
+    """验证 train/val/test 三个数据集之间没有重复文件（数据泄露检查）
+    
+    通过计算所有图片文件的 MD5 哈希值，检查是否存在：
+    1. 同一 split 内部的重复文件
+    2. 不同 split 之间的重复文件（这是数据泄露的关键指标）
+    
+    Args:
+        dataset_root: 数据集根目录
+        classes: 类别列表
+    
+    Returns:
+        dict: 验证结果报告，包含：
+            - "has_leakage": bool 是否存在数据泄露
+            - "total_files": dict 各 split 的文件总数
+            - "duplicates_within": dict 各 split 内部的重复文件
+            - "duplicates_between": list 不同 split 之间的重复文件对
+            - "report": str 格式化的报告文本
+    """
+    dataset_root = dataset_root or DATASET_ROOT
+    classes = classes or CLASSES
+
+    splits = ["train", "val", "test"]
+    split_dirs = {s: dataset_root / s for s in splits}
+
+    logger.info("=" * 60)
+    logger.info("数据泄露验证 (文件哈希比对)")
+    logger.info("=" * 60)
+
+    # 收集所有文件的哈希信息
+    # 结构: {hash_value: [{"split": "train", "path": Path, "class": "cat"}, ...]}
+    hash_to_files = {}
+    file_count = {s: 0 for s in splits}
+
+    for split in splits:
+        split_dir = split_dirs[split]
+        if not split_dir.exists():
+            logger.warning(f"  {split} 目录不存在，跳过")
+            continue
+
+        for cls in classes:
+            cls_dir = split_dir / cls
+            if not cls_dir.exists():
+                continue
+
+            for img_path in cls_dir.iterdir():
+                if not is_image_file(img_path):
+                    continue
+
+                try:
+                    file_hash = compute_file_hash(img_path)
+                    file_info = {
+                        "split": split,
+                        "path": img_path,
+                        "class": cls,
+                        "hash": file_hash,
+                    }
+
+                    if file_hash not in hash_to_files:
+                        hash_to_files[file_hash] = []
+                    hash_to_files[file_hash].append(file_info)
+                    file_count[split] += 1
+
+                except Exception as e:
+                    logger.warning(f"  无法计算哈希 {img_path}: {e}")
+
+    # 分析结果
+    duplicates_within = {s: [] for s in splits}  # 同一 split 内的重复
+    duplicates_between = []  # 不同 split 之间的重复
+    has_leakage = False
+
+    for file_hash, files in hash_to_files.items():
+        if len(files) > 1:
+            # 按 split 分组
+            splits_involved = set(f["split"] for f in files)
+
+            if len(splits_involved) == 1:
+                # 同一 split 内的重复
+                split = list(splits_involved)[0]
+                duplicates_within[split].append({
+                    "hash": file_hash,
+                    "files": [str(f["path"]) for f in files],
+                })
+            else:
+                # 不同 split 之间的重复 —— 这是数据泄露！
+                has_leakage = True
+                duplicates_between.append({
+                    "hash": file_hash,
+                    "files": [
+                        {"split": f["split"], "class": f["class"], "path": str(f["path"])}
+                        for f in files
+                    ],
+                })
+
+    # 生成报告
+    report_lines = []
+    report_lines.append("=" * 60)
+    report_lines.append("数据泄露验证报告")
+    report_lines.append("=" * 60)
+    report_lines.append("")
+    report_lines.append(f"{'数据集':<10} {'文件数':>10}")
+    report_lines.append("-" * 25)
+    for split in splits:
+        report_lines.append(f"{split:<10} {file_count[split]:>10}")
+    report_lines.append("-" * 25)
+    total = sum(file_count.values())
+    report_lines.append(f"{'合计':<10} {total:>10}")
+    report_lines.append("")
+
+    # 同一 split 内的重复（警告级别）
+    has_internal_duplicates = any(len(v) > 0 for v in duplicates_within.values())
+    if has_internal_duplicates:
+        report_lines.append("⚠️  同一数据集内的重复文件:")
+        for split in splits:
+            dupes = duplicates_within[split]
+            if dupes:
+                report_lines.append(f"   {split}: {len(dupes)} 组重复文件")
+                for i, dupe in enumerate(dupes[:5]):  # 最多显示 5 组
+                    report_lines.append(f"     哈希: {dupe['hash']}")
+                    for f in dupe["files"]:
+                        report_lines.append(f"       - {f}")
+                if len(dupes) > 5:
+                    report_lines.append(f"     ... 省略 {len(dupes) - 5} 组")
+        report_lines.append("")
+    else:
+        report_lines.append("✓  各数据集内部无重复文件")
+        report_lines.append("")
+
+    # 不同 split 之间的重复（严重错误 —— 数据泄露）
+    if duplicates_between:
+        report_lines.append("=" * 60)
+        report_lines.append("❌ 发现数据泄露！不同数据集之间存在重复文件")
+        report_lines.append("=" * 60)
+        report_lines.append(f"共发现 {len(duplicates_between)} 组跨数据集重复文件")
+        report_lines.append("")
+
+        for i, dupe in enumerate(duplicates_between[:10]):  # 最多显示 10 组
+            report_lines.append(f"重复组 #{i + 1} (哈希: {dupe['hash']}):")
+            for f in dupe["files"]:
+                report_lines.append(f"  [{f['split']}] {f['class']}: {f['path']}")
+            report_lines.append("")
+
+        if len(duplicates_between) > 10:
+            report_lines.append(f"... 省略 {len(duplicates_between) - 10} 组重复文件")
+            report_lines.append("")
+
+        report_lines.append("建议:")
+        report_lines.append("  1. 检查数据划分逻辑，确保同一张图片不会出现在多个数据集中")
+        report_lines.append("  2. 如果使用了数据增强，确保增强后的图片不会意外混入其他数据集")
+        report_lines.append("  3. 重新运行数据准备流程")
+    else:
+        report_lines.append("✓  不同数据集之间无重复文件 —— 无数据泄露")
+        report_lines.append("")
+        report_lines.append("验证结论: 数据集划分正确，不存在文件级别的数据泄露。")
+
+    # 输出报告
+    report_text = "\n".join(report_lines)
+    for line in report_lines:
+        if "❌" in line or "数据泄露" in line:
+            logger.error(line)
+        elif "⚠️" in line:
+            logger.warning(line)
+        else:
+            logger.info(line)
+
+    # 保存报告到文件
+    report_file = dataset_root / "data_leakage_verification.txt"
+    with open(report_file, "w", encoding="utf-8") as f:
+        f.write(report_text)
+    logger.info(f"验证报告已保存: {report_file}")
+
+    return {
+        "has_leakage": has_leakage,
+        "has_internal_duplicates": has_internal_duplicates,
+        "total_files": file_count,
+        "duplicates_within": duplicates_within,
+        "duplicates_between": duplicates_between,
+        "report": report_text,
+    }
+
+
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description="动物图像分类 - 数据准备")
@@ -698,6 +900,18 @@ def main():
 
     # Step 3: 打印统计摘要
     print_dataset_summary(dataset_root=dataset_root, classes=classes)
+
+    # Step 4: 验证数据泄露（文件哈希比对）
+    logger.info("")
+    verification_result = verify_no_data_leakage(
+        dataset_root=dataset_root,
+        classes=classes,
+    )
+
+    if verification_result["has_leakage"]:
+        logger.error("⚠️  数据泄露验证失败！发现跨数据集重复文件。")
+        logger.error("请检查数据划分逻辑后重新运行。")
+        sys.exit(1)
 
     logger.info("数据准备完成！可以开始训练模型。")
 
